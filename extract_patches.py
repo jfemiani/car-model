@@ -165,7 +165,7 @@ def main():
                 if len(points) == 2:
                     cx, cy = (sx + tx) / 2, (sy + ty) / 2
                 else:
-                    cx, cy = points[1]
+                    cx, cy = geo_to_pixels * points[1]
                 dx, dy = (tx - sx), (ty - sy)
                 theta = degrees(atan2(dy, dx))  # In PIXELS, CCW from +x. Not necessarily CCW from E (or CW from N)
                 r1 = hypot(tx - cx, ty - cy)
