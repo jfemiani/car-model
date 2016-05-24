@@ -42,6 +42,7 @@ import rasterio
 from affine import Affine
 from math import degrees, atan2, hypot, floor, ceil
 from osgeo import ogr, gdalnumeric
+from osgeo.osr import SpatialReference
 from rasterio._io import RasterReader, RasterUpdater
 #from skimage.transform import rescale
 from scipy.ndimage import rotate, zoom
@@ -119,13 +120,28 @@ def main():
     else:  # args['--otif']  (default)
         fmt = '.tif'
 
+
     clip  = args['--vclip'] is not None
     if clip:
         clipmin, clipmax = [float(x) for x in args['--vclip'].split(',')]
+    else:
+        clipmin, clipmax = 0, 1
 
     stretch = args['--vstretch'] is not None
     if stretch:
         stretchmin, stretchmax = [float(x) for x in args['--vstretch'].split(',')]
+
+
+    if args['--csv']:
+        csv_file_name = args['--csv']
+        if os.path.isfile(csv_file_name):
+            logger.error("CSV File already exists; please remove or rename it first.")
+            logger.debug("Writing to CSV File '{}'".format(csv_file_name))
+            return
+    else:
+        csv_file_name = None
+        logger.debug("No CSV output")
+
 
 
     # Estimate number of shape features
@@ -142,8 +158,15 @@ def main():
     if not silent:
         pbar.finish()
 
+    # Write header for CSV file
+    if csv_file_name is not None:
+        with open(os.path.join(output_folder, csv_file_name), 'w') as csvf:
+            csvf.write('gx, gy, r1, r2, theta, patch_width, patch_height, image_namei\n')
+
     with rasterio.open(raster) as rf:
         assert isinstance(rf, RasterReader)
+        srs = SpatialReference(rf.crs)
+
         affine = rf.affine
         geo_to_pixels = ~affine
 
@@ -157,6 +180,8 @@ def main():
                 if not silent:
                     pbar.update(pbar.currval+1)
                 geom = f.GetGeometryRef()
+                assert isinstance(geom, ogr.Geometry)
+                geom = geom.TransformTo(srs)
                 points = geom.GetPoints()
                 source = points[0]
                 target = points[-1]
@@ -165,7 +190,7 @@ def main():
                 if len(points) == 2:
                     cx, cy = (sx + tx) / 2, (sy + ty) / 2
                 else:
-                    cx, cy = points[1]
+                    cx, cy = geo_to_pixels * points[1]
                 dx, dy = (tx - sx), (ty - sy)
                 theta = degrees(atan2(dy, dx))  # In PIXELS, CCW from +x. Not necessarily CCW from E (or CW from N)
                 r1 = hypot(tx - cx, ty - cy)
@@ -180,7 +205,7 @@ def main():
                 x0, x1 = int(floor(cx - box_radius)), int(ceil(cx + box_radius))
                 y0, y1 = int(floor(cy - box_radius)), int(ceil(cy + box_radius))
 
-                                # save patch...
+                # save patch...
 
 
                 kwargs = rf.meta
@@ -209,10 +234,17 @@ def main():
                 box_radius *= scale
                 name = hashlib.md5(str(patch_affine) + raster).hexdigest()
                 image_name = os.path.join(output_folder, name + fmt)
+
+                if csv_file_name is not None:
+                    with open(os.path.join(output_folder, csv_file_name), 'a+') as csvf:
+                        fields = gx, gy, r1, r2, theta, patch_width, patch_height, image_name
+                        csvf.write(','.join([str(_) for _ in fields]) + '\n')
+
                 with rasterio.open(image_name, 'w', **kwargs) as pf:
                     assert isinstance(pf, RasterUpdater)
                     for band in range(rf.count):
-                        patch = rf.read(band+1, window=((y0, y1), (x0, x1)), boundless=True)
+                        patch = rf.read(band+1, window=((y0, y1), (x0, x1)), boundless=True,)
+                        patch = patch.astype(numpy.float32)
                         patch_rotated = rotate(patch, theta, reshape=False)
                         patch_scaled = zoom(patch_rotated, scale)
                         i0 = int(round(box_radius - patch_height / 2.))
@@ -226,7 +258,6 @@ def main():
                         if stretch:
                             patch_cropped = (patch_cropped-clipmin)/(clipmax-clipmin)
                             patch_cropped = patch_cropped*(stretchmax-stretchmin) + stretchmin
-                            print 'stretched', patch_cropped.min(), patch_cropped.max()
 
                         if fmt == '.jpg':
                             # JPEG does not support floating point output. All we can do is 8 bit
