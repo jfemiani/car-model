@@ -26,11 +26,14 @@ Options:
                              in a higher resolution you may choose to scale it down). [default: 1.0]
     --csv <csvfile>          Create a CSV file with the center lat/lon, center pixel xy, angle, and the patch filename
                              as well as the name of the shapefile source and the raster spource image.
-    --silent                 Suppress progress updates.
+    --noprogress             Suppress progress updates.
     --vclip <min,max>        Clip input values to `min` and `max`. Mainly useful when floating point output is not an
                              option (e.g. JPEG output).
     --vstretch <min,max>     Stretch output values to 'min' and 'max', after clipping. Mainly useful when floating point
                              output is not possible. Note that JPEG output must be in 0 to 1.
+    --debug                  Set the log level to DEBUG
+    --info                   Set the log level to INFO
+    --logfile <filename>     Log to a file [default: '']
 
 """
 import hashlib
@@ -44,7 +47,7 @@ from math import degrees, atan2, hypot, floor, ceil
 from osgeo import ogr, gdalnumeric
 from osgeo.osr import SpatialReference
 from rasterio._io import RasterReader, RasterUpdater
-#from skimage.transform import rescale
+# from skimage.transform import rescale
 from scipy.ndimage import rotate, zoom
 from skimage.util.dtype import img_as_ubyte
 
@@ -78,7 +81,20 @@ def collect_filenames(wildcard_list):
 
 def main():
     args = docopt(__doc__, version=VERSION)
-    logging.basicConfig(level=logging.INFO)
+
+    logparams = {}
+    if args['--debug']:
+        logparams.update(level=logging.DEBUG)
+    elif args['--info']:
+        logparams.update(level=logging.INFO)
+    else:
+        logparams.update(level=logging.CRITICAL)
+
+    if args['--logfile'] != '':
+        logparams.update(filename=args['--logfile'])
+
+    logging.basicConfig(**logparams)
+
     logger = logging.getLogger('extract_patches')
     logger.debug('input \n {}'.format(args))
 
@@ -94,6 +110,7 @@ def main():
     try:
         size = [int(x) for x in args['--size'].split(',')]
         patch_width, patch_height = size
+        logger.debug("Set patch size to {} x {}".format(patch_width, patch_height))
     except:
         logger.error("Unable to parse option '--size'")
         return
@@ -101,16 +118,20 @@ def main():
     try:
         scale = float(args['--scale'])
         assert scale > 0
+        logger.debug("Set scale to {}".format(scale))
     except:
         logger.error("Unable to parse option '--scale'")
         return
 
-    silent = args['--silent']
+    silent = args['--noprogress']
 
     output_folder = args['--odir']
     try:
         if not os.path.isdir(output_folder):
             os.makedirs(output_folder)
+            logger.debug("Created output folder '{}'".format(output_folder))
+        else:
+            logger.debug("Found existing output folder '{}'".format(output_folder))
     except:
         logger.error("Unable to find or create output directory `{}`".format(output_folder))
         return
@@ -119,18 +140,22 @@ def main():
         fmt = '.jpg'
     else:  # args['--otif']  (default)
         fmt = '.tif'
+    logger.debug("Output format set to {}".format(fmt))
 
-
-    clip  = args['--vclip'] is not None
+    clip = args['--vclip'] is not None
     if clip:
         clipmin, clipmax = [float(x) for x in args['--vclip'].split(',')]
+        logger.debug("Clipping output to [{}, {}]".format(clipmin, clipmax))
     else:
         clipmin, clipmax = 0, 1
+        logger.debug("Not clipping output -- assuming range of value is [{},{}]".format(clipmin, clipmax))
 
     stretch = args['--vstretch'] is not None
     if stretch:
         stretchmin, stretchmax = [float(x) for x in args['--vstretch'].split(',')]
-
+        logger.debug("Output value range will be stretched to [{},{}]".format(stretchmin, stretchmax))
+    else:
+        logger.debug("Output values will not be stretched")
 
     if args['--csv']:
         csv_file_name = args['--csv']
@@ -141,8 +166,6 @@ def main():
     else:
         csv_file_name = None
         logger.debug("No CSV output")
-
-
 
     # Estimate number of shape features
     count = 0
@@ -158,6 +181,8 @@ def main():
     if not silent:
         pbar.finish()
 
+    logger.debug("Counted {} features in {} shapefiles".format(count, len(shapefiles)))
+
     # Write header for CSV file
     if csv_file_name is not None:
         with open(os.path.join(output_folder, csv_file_name), 'w') as csvf:
@@ -165,20 +190,29 @@ def main():
 
     with rasterio.open(raster) as rf:
         assert isinstance(rf, RasterReader)
-        srs = SpatialReference(rf.crs)
-
+        srs = SpatialReference(str(rf.crs_wkt))
         affine = rf.affine
         geo_to_pixels = ~affine
+
+        logging.debug("Output CRS will be '''{}'''".format(srs.ExportToPrettyWkt()))
 
         if not silent:
             pbar = ProgressBar(count, ['Exporting Patches:', Percentage(), ' ', Bar(), ' ', ETA()])
             pbar.start()
         for sf in shapefiles:
+            logger.info("Processing input '{}'".format(sf))
             vector = ogr.Open(sf)
+            assert isinstance(vector, ogr.DataSource)
+
             layer = vector.GetLayer()
+            assert isinstance(layer, ogr.Layer)
+
+            if not srs.IsSame(layer.GetSpatialRef()):
+                logger.warning("Coordinate system mismatch (its ok, I will reproject)")
+
             for f in layer:
                 if not silent:
-                    pbar.update(pbar.currval+1)
+                    pbar.update(pbar.currval + 1)
                 geom = f.GetGeometryRef()
                 assert isinstance(geom, ogr.Geometry)
                 geom = geom.TransformTo(srs)
@@ -207,10 +241,10 @@ def main():
 
                 # save patch...
 
-
                 kwargs = rf.meta
                 patch_affine = (affine * Affine.translation(cx, cy) *
-                                Affine.rotation(angle=-theta) * Affine.translation(-patch_width / 2., -patch_height / 2.))
+                                Affine.rotation(angle=-theta) * Affine.translation(-patch_width / 2.,
+                                                                                   -patch_height / 2.))
 
                 if fmt == '.tif':
                     kwargs.update(
@@ -243,7 +277,7 @@ def main():
                 with rasterio.open(image_name, 'w', **kwargs) as pf:
                     assert isinstance(pf, RasterUpdater)
                     for band in range(rf.count):
-                        patch = rf.read(band+1, window=((y0, y1), (x0, x1)), boundless=True,)
+                        patch = rf.read(band + 1, window=((y0, y1), (x0, x1)), boundless=True, )
                         patch = patch.astype(numpy.float32)
                         patch_rotated = rotate(patch, theta, reshape=False)
                         patch_scaled = zoom(patch_rotated, scale)
@@ -256,16 +290,18 @@ def main():
                         if clip:
                             patch_cropped = numpy.clip(patch_cropped, clipmin, clipmax)
                         if stretch:
-                            patch_cropped = (patch_cropped-clipmin)/(clipmax-clipmin)
-                            patch_cropped = patch_cropped*(stretchmax-stretchmin) + stretchmin
+                            patch_cropped = (patch_cropped - clipmin) / (clipmax - clipmin)
+                            patch_cropped = patch_cropped * (stretchmax - stretchmin) + stretchmin
 
                         if fmt == '.jpg':
                             # JPEG does not support floating point output. All we can do is 8 bit
                             # (python has not 12bit array type)
-                            patch_cropped = img_as_ubyte(patch_cropped.clip(-1,1))
-                        pf.write(patch_cropped, band+1)
+                            patch_cropped = img_as_ubyte(patch_cropped.clip(-1, 1))
+                        pf.write(patch_cropped, band + 1)
         if not silent:
             pbar.finish()
+
+        logger.debug("Finished.")
 
 if __name__ == '__main__':
     main()
