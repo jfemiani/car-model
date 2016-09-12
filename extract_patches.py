@@ -34,7 +34,9 @@ Options:
     --debug                  Set the log level to DEBUG
     --info                   Set the log level to INFO
     --logfile <filename>     Log to a file [default: '']
-
+    --psource                Index of the source point used to determine the object position and rotation. [default:0]
+    --ptarget                Index of the targer point used to determine the object position and rotation. [default:-1]
+    --pcenter                Index of the center point uded to determine the object position. [defualt: None]
 """
 import hashlib
 import os
@@ -77,6 +79,9 @@ def collect_filenames(wildcard_list):
         for filename in matching_files:
             results.append(filename)
     return results
+
+
+
 
 
 def main():
@@ -213,23 +218,41 @@ def main():
             for f in layer:
                 if not silent:
                     pbar.update(pbar.currval + 1)
+
                 geom = f.GetGeometryRef()
                 assert isinstance(geom, ogr.Geometry)
-                geom = geom.TransformTo(srs)
-                points = geom.GetPoints()
-                source = points[0]
-                target = points[-1]
-                sx, sy = geo_to_pixels * source
+                geom.TransformTo(srs)
+                geo_points = geom.GetPoints()
+
+                # The center and direction are determine based on two points.
+                # I am using the first and last.
+                source = geo_points[0]
+                target = geo_points[-1]
+
+                # First the center
+                sx, sy = geo_to_pixels * source   # <- this converts from map coordinates to pixel indices
                 tx, ty = geo_to_pixels * target
-                if len(points) == 2:
+                if len(geo_points) == 2:
                     cx, cy = (sx + tx) / 2, (sy + ty) / 2
                 else:
-                    cx, cy = geo_to_pixels * points[1]
+                    # For trees, we mark three points. In that case, I want the middle point to be considered the
+                    # center
+                    cx, cy = geo_to_pixels * geo_points[1]
+
+                # Now the direction
                 dx, dy = (tx - sx), (ty - sy)
                 theta = degrees(atan2(dy, dx))  # In PIXELS, CCW from +x. Not necessarily CCW from E (or CW from N)
+
+
+                # We also determine the scale (in pixels) as a radius.
+                # For trees, there are two radii because we want the image to be big enough to fit the shadow
+                # and also the canopy, but we want it centered on the tree.
                 r1 = hypot(tx - cx, ty - cy)
                 r2 = hypot(cx - sx, cy - sy)
                 r1, r2 = max(r1, r2), min(r1, r2)  # For 3 points, we assume two radii. Else these are duplicates.
+
+
+                # When we write coordinates back out, they shoulf be in map coordinates.
                 gx, gy = affine * (cx, cy)  # Geographic coordinates (e.g. lat lon) of the center.
 
                 # We read a square slightly larger than the scaled version of our patch, so that
@@ -239,35 +262,29 @@ def main():
                 x0, x1 = int(floor(cx - box_radius)), int(ceil(cx + box_radius))
                 y0, y1 = int(floor(cy - box_radius)), int(ceil(cy + box_radius))
 
-                # save patch...
+                ## Now we save the image patch, rotated.
 
+                # When we save the image, we need to specify the Affine transform that positions it properly in a map.
+                # Otherwise the image would not render in the right position if we load it into somethign like QGIS.
+                patch_affine = (affine *
+                                Affine.translation(cx, cy) *
+                                Affine.rotation(angle=-theta) *
+                                Affine.translation(-patch_width / 2., -patch_height / 2.))
+
+                # Determine the file metadata
                 kwargs = rf.meta
-                patch_affine = (affine * Affine.translation(cx, cy) *
-                                Affine.rotation(angle=-theta) * Affine.translation(-patch_width / 2.,
-                                                                                   -patch_height / 2.))
-
+                kwargs.update(transform=patch_affine, width=patch_width, height=patch_height)
                 if fmt == '.tif':
-                    kwargs.update(
-                        driver='GTiff',
-                        compress='lzw',
-                        dtype=numpy.float32
-                    )
+                    kwargs.update(driver='GTiff', compress='lzw', dtype=numpy.float32)
                 elif fmt == '.jpg':
-                    kwargs.update(
-                        driver='JPEG',
-                        quality=90,
-                        dtype=numpy.uint8
-                    )
+                    kwargs.update(driver='JPEG', quality=90, dtype=numpy.uint8)
 
-                kwargs.update(
-                    transform=patch_affine,
-                    width=patch_width,
-                    height=patch_height
-                )
+                # Name patches based on a hash of their position in the map
+                name = '{}E-{}N-{}x{}'.format(str(gx).replace('.', '_'), str(gy).replace('.', '_'),
+                                              patch_width, patch_height)
+                image_name = os.path.join(output_folder, name + fmt)
 
                 box_radius *= scale
-                name = hashlib.md5(str(patch_affine) + raster).hexdigest()
-                image_name = os.path.join(output_folder, name + fmt)
 
                 if csv_file_name is not None:
                     with open(os.path.join(output_folder, csv_file_name), 'a+') as csvf:
@@ -279,16 +296,22 @@ def main():
                     for band in range(rf.count):
                         patch = rf.read(band + 1, window=((y0, y1), (x0, x1)), boundless=True, )
                         patch = patch.astype(numpy.float32)
+
+                        # The patch is a square centered on the object.
+                        # We want to rotate it, scale it, and crop it to fit the object.
                         patch_rotated = rotate(patch, theta, reshape=False)
                         patch_scaled = zoom(patch_rotated, scale)
                         i0 = int(round(box_radius - patch_height / 2.))
-                        i1 = i0 + patch_height
                         j0 = int(round(box_radius - patch_width / 2.))
+                        i1 = i0 + patch_height
                         j1 = j0 + patch_width
                         patch_cropped = patch_scaled[i0:i1, j0:j1]
 
+                        # Sometime we want to limit the range of output values (e.g. 0..255)
                         if clip:
                             patch_cropped = numpy.clip(patch_cropped, clipmin, clipmax)
+
+                        # Sometimes we want to stretch the range of output values (e.g. scale it to fit in 0..255)
                         if stretch:
                             patch_cropped = (patch_cropped - clipmin) / (clipmax - clipmin)
                             patch_cropped = patch_cropped * (stretchmax - stretchmin) + stretchmin
@@ -297,6 +320,7 @@ def main():
                             # JPEG does not support floating point output. All we can do is 8 bit
                             # (python has not 12bit array type)
                             patch_cropped = img_as_ubyte(patch_cropped.clip(-1, 1))
+
                         pf.write(patch_cropped, band + 1)
         if not silent:
             pbar.finish()
