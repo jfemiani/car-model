@@ -34,9 +34,10 @@ Options:
     --debug                  Set the log level to DEBUG
     --info                   Set the log level to INFO
     --logfile <filename>     Log to a file [default: '']
-    --psource                Index of the source point used to determine the object position and rotation. [default:0]
-    --ptarget                Index of the targer point used to determine the object position and rotation. [default:-1]
-    --pcenter                Index of the center point uded to determine the object position. [defualt: None]
+    --psource <index>        Index of the source point used to determine the object position and rotation. [default: 0]
+    --ptarget <index>        Index of the targer point used to determine the object position and rotation. [default: -1]
+    --pcenter <index>        Index of the center point uded to determine the object position. If this option is missing
+                             we use some other scheme to estimate the center
 """
 import hashlib
 import os
@@ -162,6 +163,19 @@ def main():
     else:
         logger.debug("Output values will not be stretched")
 
+    psource = int(args["--psource"])
+    ptarget = int(args["--ptarget"])
+    use_centroid = True
+    pcenter = 0
+    if args["--pcenter"] is not None:
+        use_centroid = False
+        pcenter = args["--pcenter"]
+    logger.debug('Orientation will be determined using point {}, and point {}'.format(psource, ptarget))
+    if use_centroid:
+        logger.debug('The center will be determined using the average of psource and ptarget')
+    else:
+        logger.debug('The center will be determined using the point {}'.format(pcenter))
+
     if args['--csv']:
         csv_file_name = args['--csv']
         if os.path.isfile(csv_file_name):
@@ -226,18 +240,18 @@ def main():
 
                 # The center and direction are determine based on two points.
                 # I am using the first and last.
-                source = geo_points[0]
-                target = geo_points[-1]
+                source = geo_points[psource]
+                target = geo_points[ptarget]
 
                 # First the center
                 sx, sy = geo_to_pixels * source   # <- this converts from map coordinates to pixel indices
                 tx, ty = geo_to_pixels * target
-                if len(geo_points) == 2:
+                if use_centroid:
                     cx, cy = (sx + tx) / 2, (sy + ty) / 2
                 else:
                     # For trees, we mark three points. In that case, I want the middle point to be considered the
                     # center
-                    cx, cy = geo_to_pixels * geo_points[1]
+                    cx, cy = geo_to_pixels * geo_points[pcenter]
 
                 # Now the direction
                 dx, dy = (tx - sx), (ty - sy)
