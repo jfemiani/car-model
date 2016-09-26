@@ -209,7 +209,7 @@ def main():
 
     with rasterio.open(raster) as rf:
         assert isinstance(rf, RasterReader)
-        srs = SpatialReference(str(rf.crs_wkt))
+        srs = SpatialReference(str(rf.crs.wkt))
         affine = rf.affine
         geo_to_pixels = ~affine
 
@@ -234,6 +234,9 @@ def main():
                     pbar.update(pbar.currval + 1)
 
                 geom = f.GetGeometryRef()
+                if geom is None:
+		    logging.warn("Missing Geometry for featur {}".format(f.GetFID()))
+                    continue
                 assert isinstance(geom, ogr.Geometry)
                 geom.TransformTo(srs)
                 geo_points = geom.GetPoints()
@@ -324,16 +327,21 @@ def main():
                         # Sometime we want to limit the range of output values (e.g. 0..255)
                         if clip:
                             patch_cropped = numpy.clip(patch_cropped, clipmin, clipmax)
+			else:
+			    clipmin = numpy.percentile(patch_cropped.flat, 5)
+                            clipmax = numpy.percentile(patch_cropped.flat, 95)
 
                         # Sometimes we want to stretch the range of output values (e.g. scale it to fit in 0..255)
                         if stretch:
                             patch_cropped = (patch_cropped - clipmin) / (clipmax - clipmin)
                             patch_cropped = patch_cropped * (stretchmax - stretchmin) + stretchmin
+                            patch_cropped.clip(stretchmin, stretchmax)
 
                         if fmt == '.jpg':
                             # JPEG does not support floating point output. All we can do is 8 bit
                             # (python has not 12bit array type)
                             patch_cropped = img_as_ubyte(patch_cropped.clip(-1, 1))
+                            
 
                         pf.write(patch_cropped, band + 1)
         if not silent:
